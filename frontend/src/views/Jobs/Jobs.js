@@ -71,6 +71,7 @@ class Jobs extends Component {
               </Link>
            }</td>
             <td>{ entry[1].query }</td>
+            <td>{ entry[1].sensors }</td>
             <td>{ entry[1].state }</td>
             <td>{ entry[1].id in urls ? <Link to={ urls[entry[1].id] }>Get PCAP</Link> : "Unavailable"}</td>
           </tr>
@@ -102,6 +103,7 @@ class Jobs extends Component {
             <th>Request Time</th>
             <th>ID</th>
             <th>Query</th>
+            <th>Sensors</th>
             <th>State</th>
             <th>URL</th>
           </tr></thead>

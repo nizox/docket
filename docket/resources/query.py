@@ -93,7 +93,7 @@ class Query:
 
         Query(f).enqueue()  shorthand
     """
-    Tuple = namedtuple('QueryTuple', ['query', 'time'] )
+    Tuple = namedtuple('QueryTuple', ['query', 'time', 'sensors'] )
 
     LONG_AGO = -1 * abs(parse_duration(Config.get('LONG_AGO', '24h')))
 
@@ -127,11 +127,12 @@ class Query:
         SUCCESS,
     )
 
-    def __init__(self, fields=None, qt=None, q_id=None, query=None):
+    def __init__(self, fields=None, qt=None, q_id=None, query=None, sensors=None):
         self.query = None           # string: query formatted for stenoapi
         self.state = None           # string: one of (RECEIVING, RECEIVED, MERGE, SUCCESS, ERROR, FAIL)
         self._id = None             # a hash of the normalized query string, uniquely identifies this query to prevent duplicates
         self.events = []            # a sorted list of events including errors... TODO FIX ME
+        self.sensors = []           # limit the query to those sensors (empty means execute on every sensors)
 
         if qt:
             self._detupify(qt)
@@ -142,8 +143,12 @@ class Query:
         if query and is_str(query):
             self.query = query
 
+        if sensors:
+            self.sensors = sensors
+
         if fields and isinstance(fields, dict):
             self._build_query(fields)
+
 
     def load(self, path=None, q_id=None, from_file=False):
         """ query data, if no path is provided use the default (requires id)
@@ -211,11 +216,15 @@ class Query:
 
     def tupify(self):       # We can't queue an object. This is all the data we need to use queue in the celery worker
         """ Serializes the basic values used to define a query into a tuple """
-        return Query.Tuple(self.query, self.queried.strftime(ISOFORMAT))
+        return Query.Tuple(self.query, self.queried.strftime(ISOFORMAT), self.sensors)
 
     def _detupify(self, query_tuple):
-        query_tuple = Query.Tuple(*query_tuple)        # namedTuples lose their names when serialized
+        if len(query_tuple) == 2:
+            query_tuple = Query.Tuple(query_tuple[0], query_tuple[1], []) # compatibility with previous query tuples
+        else:
+            query_tuple = Query.Tuple(*query_tuple)        # namedTuples lose their names when serialized
         self.query = query_tuple.query
+        self.sensors = query_tuple.sensors
         self.events = [Event(datetime=datetime.strptime(query_tuple.time, ISOFORMAT), name=Query.CREATED, msg=None, state=Query.CREATED)]
         self._fix_events()
 
@@ -230,7 +239,7 @@ class Query:
             return self._id
         elif self.query:
             # calculate a 'query' hash to be our id
-            self._id = md5(self.query)
+            self._id = md5(self.query + ''.join(sorted(frozenset(self.sensors))))
             if Config.get('UUID_FORMAT'):
                 self._id = '-'.join((self._id[:8], self._id[8:12], self._id[12:16], self._id[16:20], self._id[20:]))
             return self._id
@@ -320,6 +329,7 @@ class Query:
                     'before-ago' : None,
                     'after' : None,
                     'before' : None,
+                    'sensors' : [],
                    }
         q_fields.update(fields)
         self.progress(Query.CREATED, state=Query.CREATED)
@@ -421,9 +431,11 @@ class Query:
 
         Config.logger.debug("build_query: <{}>".format(self.query))
 
-        # if we want to support limiting the query, it would require rethinking our duplicate detection
-        #if q_fields['sensors']:
-        #    self.sensors = q_fields['sensors']
+        if q_fields['sensors']:
+            for sensor in q_fields['sensors']:
+                if sensor not in _SENSORS:
+                    raise BadRequest("Sensor %s does not exist" % (sensor))
+            self.sensors = list(frozenset(q_fields['sensors']))
         return self.id
 
     @classmethod
@@ -453,7 +465,11 @@ class Query:
                         q = None
                         break
                     pass
-                elif k in ('sensors', 'limit-packets', 'limit-bytes'):
+                elif k in ('sensors',):
+                    if frozenset(q.sensors) != frozenset(v):
+                        q = None
+                        break
+                elif k in ('limit-packets', 'limit-bytes'):
                     continue
                 elif k not in q.query:
                     Config.logger.info("Skipping: {} - {}".format(q.query, k))
@@ -481,6 +497,7 @@ class Query:
             col("id", "ID", "id"),
             col("url", "Pcap URL", "url"),
             col("query", "Query", "string"),
+            col("sensors", "Sensors", "string"),
         ]
         return columns
 
@@ -490,7 +507,7 @@ class Query:
                  'query': self.query,
                  'url': self.pcap_url,
                  'time' : self.time_requested(),
-                 'query': self.query}
+                 'sensors': ' and '.join(self.sensors) or 'All'}
 
     def enqueue(self):
         """ queue this query in celery for fulfillment """
@@ -630,7 +647,7 @@ def parse_json():
     # we explain a bunch of arguments to reqparse, and parse_args() gives us a dictionary to return or spits an exception
     rp = reqparse.RequestParser(trim=True, bundle_errors=True)
 
-    rp.add_argument('sensor', action='append', default=[], type=lambda x: str(x),
+    rp.add_argument('sensors', action='append', default=[], type=lambda x: str(x),
                     help='Name of sensors to query, matches sensor names in docket config (accepts multiple values)')
     rp.add_argument('host', action='append', default=[], type=lambda x: str(x),
                     help='IP address (accepts multiples)')
@@ -707,12 +724,13 @@ def parse_uri(path):
             'before-ago' : None,
             'after' : None,
             'before' : None,
+            'sensors': [],
             }
 
     state = None
     for arg in path.split('/'):
         if state is None:
-            if arg.upper() in ("HOST", "NET", "PORT", "PROTO", "BEFORE", "AFTER"):
+            if arg.upper() in ("HOST", "NET", "PORT", "PROTO", "BEFORE", "AFTER", "SENSOR"):
                 state = arg.upper()
             elif arg.upper() in ("UDP", "TCP", "ICMP"):
                 q_fields['proto-name']= arg.lower()
@@ -740,6 +758,9 @@ def parse_uri(path):
             del(q_fields['nettmp'])
         elif state in ["BEFORE", "AFTER"]:
             q_fields[state.lower()] = arg
+            state = None
+        elif state == "SENSOR":
+            q_fields["sensors"].append(arg)
             state = None
 
     if state != None:
@@ -838,6 +859,9 @@ class RawRequest(Resource):
         for k,v in request.form.lists():
             if k == 'query':
                 q.query += v
+                break
+            if k == 'sensor':
+                q.sensors.append(v)
                 break
             elif not v or v == [u'']:
                 q.query += k

@@ -151,6 +151,9 @@ def query_task(query_tuple, headers=None):
     threads = []
     # Query each instance concurrently
     for instance in _INSTANCES:
+        # do not execute query on ignored sensors
+        if query.sensors and instance['sensor'] not in query.sensors:
+            continue
         from threading import Thread
         thread = Thread(target=_requester, args=(query, instance, headers))
         thread.start()
